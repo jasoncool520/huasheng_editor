@@ -1120,20 +1120,28 @@ const markdown = \`![图片](img://\${imageId})\`;
       const pv = this.$refs.previewScroll;
       if (!ta || !pv) return;
 
-      this._syncLock = false;
-      // scroll 同步：加锁防止两侧互相触发死循环
-      ta.addEventListener('scroll', () => {
-        if (this._syncLock) return;
-        this._syncLock = true;
-        this.syncPreviewToEditor();
-        requestAnimationFrame(() => { this._syncLock = false; });
-      });
-      pv.addEventListener('scroll', () => {
-        if (this._syncLock) return;
-        this._syncLock = true;
-        this.syncEditorToPreview();
-        requestAnimationFrame(() => { this._syncLock = false; });
-      });
+      this._scrollSyncSource = null;
+      this._scrollSyncFrame = null;
+      this._scrollSyncFrameSource = null;
+
+      // 只同步用户正在操作的一侧。对侧的 scroll 事件是代码设置 scrollTop
+      // 产生的，不能再反向同步，否则异步 scroll 事件会绕过短暂的帧锁并来回修正位置。
+      const watchScrollIntent = (el, source) => {
+        ['wheel', 'touchstart', 'pointerdown'].forEach((type) => {
+          el.addEventListener(type, () => { this._scrollSyncSource = source; }, { passive: true });
+        });
+        el.addEventListener('keydown', (e) => {
+          if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) {
+            this._scrollSyncSource = source;
+          }
+        });
+      };
+
+      watchScrollIntent(ta, 'editor');
+      watchScrollIntent(pv, 'preview');
+
+      ta.addEventListener('scroll', () => this.queueScrollSync('editor'), { passive: true });
+      pv.addEventListener('scroll', () => this.queueScrollSync('preview'), { passive: true });
 
       // 点击/移动光标 → 预览跳转
       ta.addEventListener('click', () => this.jumpPreviewToCaret());
@@ -1160,6 +1168,34 @@ const markdown = \`![图片](img://\${imageId})\`;
       return Math.max(1, (this.markdownInput.match(/\n/g) || []).length + 1);
     },
 
+    queueScrollSync(source) {
+      if (this._scrollSyncSource !== source) return;
+      if (this._scrollSyncFrame !== null) {
+        if (this._scrollSyncFrameSource === source) return;
+        cancelAnimationFrame(this._scrollSyncFrame);
+      }
+      this._scrollSyncFrameSource = source;
+      this._scrollSyncFrame = requestAnimationFrame(() => {
+        this._scrollSyncFrame = null;
+        this._scrollSyncFrameSource = null;
+        if (this._scrollSyncSource !== source) return;
+        if (source === 'editor') this.syncEditorToPreview();
+        else this.syncPreviewToEditor();
+      });
+    },
+
+    scrollProgress(el) {
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      return maxScroll > 0 ? Math.max(0, Math.min(1, el.scrollTop / maxScroll)) : 0;
+    },
+
+    setScrollProgress(el, progress) {
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      if (maxScroll <= 0) return;
+      const nextScrollTop = Math.max(0, Math.min(maxScroll, progress * maxScroll));
+      if (Math.abs(el.scrollTop - nextScrollTop) > 1) el.scrollTop = nextScrollTop;
+    },
+
     // 元素相对滚动容器的顶部偏移
     elTopInScroll(el, container) {
       return el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
@@ -1183,28 +1219,16 @@ const markdown = \`![图片](img://\${imageId})\`;
       return Math.max(0, loTop + frac * (hiTop - loTop) - 12);
     },
 
-    syncPreviewToEditor() {
-      const ta = this.$refs.editorTextarea;
-      const pv = this.$refs.previewScroll;
-      const denom = ta.scrollHeight - ta.clientHeight;
-      const ratio = denom > 0 ? ta.scrollTop / denom : 0;
-      const topLine = ratio * this.totalSourceLines();
-      pv.scrollTop = this.previewScrollForLine(topLine);
-    },
-
     syncEditorToPreview() {
       const ta = this.$refs.editorTextarea;
       const pv = this.$refs.previewScroll;
-      const els = this.sourceLineEls();
-      if (!els.length) return;
-      // 找到滚动到顶部的锚点元素
-      let top = els[0];
-      for (const o of els) {
-        if (this.elTopInScroll(o.el, pv) <= pv.scrollTop + 6) top = o;
-        else break;
-      }
-      const denom = ta.scrollHeight - ta.clientHeight;
-      ta.scrollTop = (top.line / this.totalSourceLines()) * denom;
+      this.setScrollProgress(pv, this.scrollProgress(ta));
+    },
+
+    syncPreviewToEditor() {
+      const ta = this.$refs.editorTextarea;
+      const pv = this.$refs.previewScroll;
+      this.setScrollProgress(ta, this.scrollProgress(pv));
     },
 
     caretSourceLine() {
@@ -1224,10 +1248,8 @@ const markdown = \`![图片](img://\${imageId})\`;
       const pv = this.$refs.previewScroll;
       if (!pv) return;
       const line = this.caretSourceLine();
-      this._syncLock = true;
+      this._scrollSyncSource = null;
       pv.scrollTo({ top: this.previewScrollForLine(line), behavior: 'smooth' });
-      clearTimeout(this._syncUnlock);
-      this._syncUnlock = setTimeout(() => { this._syncLock = false; }, 260);
       // 高亮对应块
       const els = this.sourceLineEls();
       let match = els.length ? els[0] : null;
@@ -1245,13 +1267,11 @@ const markdown = \`![图片](img://\${imageId})\`;
       if (isNaN(line)) return;
       const ta = this.$refs.editorTextarea;
       const offset = this.lineStartOffset(line);
-      this._syncLock = true;
+      this._scrollSyncSource = null;
       ta.focus();
       ta.setSelectionRange(offset, offset);
       const denom = ta.scrollHeight - ta.clientHeight;
       ta.scrollTop = (line / this.totalSourceLines()) * denom;
-      clearTimeout(this._syncUnlock);
-      this._syncUnlock = setTimeout(() => { this._syncLock = false; }, 260);
       this.flashSourceEl(node);
     },
 
